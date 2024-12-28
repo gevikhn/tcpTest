@@ -7,179 +7,193 @@
 #include <mutex>
 #include <condition_variable>
 #include <map>
+#include <atomic>
+#include <future>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include "frame.h"
 
-class TcpClient : public TcpConnection, public FrameHandler {
+class TcpClient {
 public:
-    using ResponseCallback = std::function<void(uint32_t stream_id, uint32_t sequence, const std::vector<uint8_t>&)>;
-    using ConnectCallback = std::function<void(bool)>;
-    using ChecksumCallback = std::function<void(bool valid, uint32_t stream_id, uint32_t sequence)>;
+    using ResponseCallback = std::function<void(int stream_id, int sequence, const std::vector<uint8_t>& data)>;
 
-    TcpClient() {
-        setFrameCallback([this](const Frame& frame) {
-            auto it = pending_requests_.find(frame.stream_id);
-            if (it != pending_requests_.end()) {
-                auto& callbacks = it->second;
-                auto callback_it = callbacks.find(frame.sequence / 5);
-                if (callback_it != callbacks.end()) {
-                    callback_it->second(frame.stream_id, frame.sequence, frame.payload);
-                }
-            }
-        });
-    }
+    TcpClient() : socket_(-1), running_(false), next_stream_id_(0) {}
 
     ~TcpClient() {
-        stop();
+        disconnect();
     }
 
-    bool connect(const std::string& ip, int port) {
-        sock_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock_fd_ < 0) {
+    bool connect(const std::string& host, int port) {
+        if (socket_ >= 0) {
             return false;
         }
 
-        sockaddr_in server_addr{};
+        socket_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_ < 0) {
+            std::cerr << "创建socket失败" << std::endl;
+            return false;
+        }
+
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(port);
         
-        if (inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr) <= 0) {
-            close(sock_fd_);
+        if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
+            std::cerr << "地址转换失败" << std::endl;
+            close(socket_);
+            socket_ = -1;
             return false;
         }
 
-        if (::connect(sock_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            close(sock_fd_);
+        std::cout << "正在连接服务器..." << std::endl;
+        if (::connect(socket_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            std::cerr << "连接服务器失败" << std::endl;
+            close(socket_);
+            socket_ = -1;
             return false;
         }
 
+        std::cout << "连接到服务器" << std::endl;
         running_ = true;
         read_thread_ = std::thread(&TcpClient::handleRead, this);
-        write_thread_ = std::thread(&TcpClient::handleWrite, this);
-
-        if (connect_callback_) {
-            connect_callback_(true);
-        }
-
         return true;
     }
 
-    void stop() {
-        if (running_) {
-            running_ = false;
-            if (sock_fd_ >= 0) {
-                close(sock_fd_);
-                sock_fd_ = -1;
-            }
-            
-            cv_.notify_all();
-            
-            if (read_thread_.joinable()) {
-                read_thread_.join();
-            }
-            if (write_thread_.joinable()) {
-                write_thread_.join();
-            }
+    void disconnect() {
+        running_ = false;
+        
+        if (socket_ >= 0) {
+            shutdown(socket_, SHUT_RDWR);
+            close(socket_);
+            socket_ = -1;
+        }
+
+        if (read_thread_.joinable()) {
+            read_thread_.join();
+        }
+
+        // 清理所有等待的响应
+        {
+            std::lock_guard<std::mutex> lock(response_handlers_mutex_);
+            response_handlers_.clear();
         }
     }
 
-    // 发送请求并设置回调处理响应
-    void request(uint32_t stream_id, uint32_t sequence, const std::vector<uint8_t>& payload, 
-                ResponseCallback callback) {
-        auto frame = createFrame(stream_id, sequence, payload);
+    // 发送消息并等待响应
+    bool sendAndWaitResponse(const std::vector<uint8_t>& payload, int& stream_id,
+                           std::vector<uint8_t>& response, int timeout_ms = 5000) {
+        stream_id = getNextStreamId();
+        
+        // 创建promise和future用于等待响应
+        auto promise_ptr = std::make_shared<std::promise<std::vector<uint8_t>>>();
+        auto future = promise_ptr->get_future();
+        
+        // 注册响应处理器
+        {
+            std::lock_guard<std::mutex> lock(response_handlers_mutex_);
+            response_handlers_[stream_id] = [promise_ptr](const std::vector<uint8_t>& data) {
+                promise_ptr->set_value(data);
+            };
+        }
+        
+        // 发送消息
+        Frame frame;
+        frame.stream_id = stream_id;
+        frame.sequence = 1;
+        frame.payload = payload;
+        frame.length = payload.size();
         frame.calculateChecksum();
         
-        std::vector<uint8_t> frame_data = frame.serialize();
-        
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            pending_requests_[stream_id][sequence] = std::move(callback);
-            outgoing_queue_.push(std::move(frame_data));
+        std::vector<uint8_t> data = frame.serialize();
+        if (!write(data)) {
+            std::lock_guard<std::mutex> lock(response_handlers_mutex_);
+            response_handlers_.erase(stream_id);
+            return false;
         }
-        cv_.notify_one();
+        
+        // 等待响应
+        auto status = future.wait_for(std::chrono::milliseconds(timeout_ms));
+        if (status == std::future_status::timeout) {
+            std::lock_guard<std::mutex> lock(response_handlers_mutex_);
+            response_handlers_.erase(stream_id);
+            return false;
+        }
+        
+        response = future.get();
+        return true;
     }
 
-    void setConnectCallback(ConnectCallback cb) {
-        connect_callback_ = std::move(cb);
+protected:
+    bool write(const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        
+        size_t total_sent = 0;
+        while (total_sent < data.size()) {
+            ssize_t sent = ::send(socket_, data.data() + total_sent, 
+                                data.size() - total_sent, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            total_sent += sent;
+        }
+        
+        std::cout << "成功发送 " << total_sent << " 字节数据" << std::endl;
+        return true;
     }
 
-    void setChecksumCallback(ChecksumCallback cb) {
-        checksum_callback_ = std::move(cb);
-    }
-
-    void setReadBufferSize(size_t size) {
-        read_buffer_size_ = size;
-    }
-
-private:
     void handleRead() {
-        std::vector<uint8_t> buffer(read_buffer_size_);
+        std::vector<uint8_t> buffer(4096);
+        size_t total_received = 0;
+        std::vector<uint8_t> frame_buffer;
+        FrameParser frame_parser;
 
         while (running_) {
-            ssize_t bytes_read = recv(sock_fd_, buffer.data(), buffer.size(), 0);
+            ssize_t bytes_read = recv(socket_, buffer.data(), buffer.size(), 0);
             if (bytes_read <= 0) {
-                if (connect_callback_) {
-                    connect_callback_(false);
-                }
+                if (errno == EINTR) continue;
                 break;
             }
 
-            processIncomingData({buffer.begin(), buffer.begin() + bytes_read});
-        }
-    }
+            total_received += bytes_read;
+            std::cout << "累计接收 " << total_received << " 字节数据" << std::endl;
 
-    void handleWrite() {
-        while (running_) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            while (running_ && outgoing_queue_.empty()) {
-                cv_.wait(lock);
-            }
-            
-            if (!running_) break;
+            frame_buffer.insert(frame_buffer.end(), buffer.begin(), buffer.begin() + bytes_read);
 
-            auto data = std::move(outgoing_queue_.front());
-            outgoing_queue_.pop();
-            lock.unlock();
+            size_t bytes_consumed;
+            auto frames = frame_parser.processData(frame_buffer, bytes_consumed);
 
-            ::send(sock_fd_, data.data(), data.size(), 0);
-        }
-    }
-
-    void processIncomingData(const std::vector<uint8_t>& data) {
-        frame_buffer_.insert(frame_buffer_.end(), data.begin(), data.end());
-        
-        size_t bytes_consumed;
-        std::vector<Frame> frames = frame_parser_.processData(frame_buffer_, bytes_consumed);
-        
-        if (bytes_consumed > 0) {
-            frame_buffer_.erase(frame_buffer_.begin(), frame_buffer_.begin() + bytes_consumed);
-        }
-
-        for (const auto& frame : frames) {
-            bool checksum_valid = frame.verifyChecksum();
-            if (checksum_callback_) {
-                checksum_callback_(checksum_valid, frame.stream_id, frame.sequence);
-            }
-            if (!checksum_valid) {
-                continue;
+            if (bytes_consumed > 0) {
+                frame_buffer.erase(frame_buffer.begin(), frame_buffer.begin() + bytes_consumed);
             }
 
-            auto it = pending_requests_.find(frame.stream_id);
-            if (it != pending_requests_.end()) {
-                auto& callbacks = it->second;
-                auto callback_it = callbacks.find(frame.sequence / 5);
-                if (callback_it != callbacks.end()) {
-                    callback_it->second(frame.stream_id, frame.sequence, frame.payload);
+            for (const auto& frame : frames) {
+                std::lock_guard<std::mutex> lock(response_handlers_mutex_);
+                auto it = response_handlers_.find(frame.stream_id);
+                if (it != response_handlers_.end()) {
+                    it->second(frame.payload);
+                    response_handlers_.erase(it);
                 }
             }
         }
     }
 
+    int getNextStreamId() {
+        return next_stream_id_++;
+    }
+
+private:
+    std::atomic<int> socket_;
+    std::atomic<bool> running_;
     std::thread read_thread_;
-    std::thread write_thread_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::queue<std::vector<uint8_t>> outgoing_queue_;
-    std::map<uint32_t, std::map<uint32_t, ResponseCallback>> pending_requests_;
-    ConnectCallback connect_callback_;
-    ChecksumCallback checksum_callback_;
-    size_t read_buffer_size_ = 1024;
+    std::mutex write_mutex_;
+    std::mutex response_handlers_mutex_;
+    std::map<int, std::function<void(const std::vector<uint8_t>&)>> response_handlers_;
+    std::atomic<int> next_stream_id_;
 };

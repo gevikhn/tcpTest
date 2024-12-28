@@ -4,6 +4,7 @@
 #include <vector>
 #include <list>
 #include <numeric>
+#include <iostream>
 
 // Frame格式:
 // | Frame Length (4 bytes) | Stream ID (4 bytes) | Sequence (4 bytes) | Checksum (4 bytes) | Payload |
@@ -15,6 +16,7 @@ struct Frame {
     uint32_t sequence;   // 序列号
     uint32_t checksum;   // 校验和
     std::vector<uint8_t> payload;
+    int client_id{-1};   // 客户端ID，不参与序列化
 
     static bool enable_checksum;  // 是否启用校验和
 
@@ -84,6 +86,10 @@ struct Frame {
     static Frame deserialize(const std::vector<uint8_t>& data) {
         Frame frame;
         
+        if (data.size() < HEADER_SIZE) {
+            throw std::runtime_error("数据太短，无法解析帧头");
+        }
+        
         // 解析length
         frame.length = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
         
@@ -95,6 +101,11 @@ struct Frame {
 
         // 解析checksum
         frame.checksum = (data[12] << 24) | (data[13] << 16) | (data[14] << 8) | data[15];
+        
+        // 验证payload长度
+        if (data.size() < HEADER_SIZE + frame.length) {
+            throw std::runtime_error("数据太短，无法解析完整payload");
+        }
         
         // 解析payload
         frame.payload.assign(data.begin() + HEADER_SIZE, data.begin() + HEADER_SIZE + frame.length);
@@ -152,68 +163,50 @@ public:
         std::vector<Frame> completed_frames;
         bytes_consumed = 0;
 
-        // 处理所有进行中的帧
-        auto it = active_frames_.begin();
-        while (it != active_frames_.end()) {
-            FrameParseState& parse_state = *it;
-            bool frame_completed = false;
+        try {
+            while (bytes_consumed < data.size()) {
+                // 尝试解析一个完整的帧
+                if (data.size() - bytes_consumed >= Frame::HEADER_SIZE) {
+                    // 先读取帧头，获取长度
+                    uint32_t frame_length = (data[bytes_consumed] << 24) | 
+                                          (data[bytes_consumed + 1] << 16) | 
+                                          (data[bytes_consumed + 2] << 8) | 
+                                          data[bytes_consumed + 3];
 
-            // 继续处理这个帧
-            if (parse_state.state == State::READING_HEADER) {
-                // 读取头部
-                while (parse_state.header_bytes_read < Frame::HEADER_SIZE && 
-                       bytes_consumed < data.size()) {
-                    parse_state.header_buffer[parse_state.header_bytes_read++] = data[bytes_consumed++];
-                }
-
-                if (parse_state.header_bytes_read == Frame::HEADER_SIZE) {
-                    // 头部读取完成，解析头部
-                    uint32_t length, stream_id, sequence, checksum;
-                    if (Frame::parseHeader(parse_state.header_buffer, length, stream_id, sequence, checksum)) {
-                        parse_state.frame.length = length;
-                        parse_state.frame.stream_id = stream_id;
-                        parse_state.frame.sequence = sequence;
-                        parse_state.frame.checksum = checksum;
-                        parse_state.frame.payload.resize(length);
-                        parse_state.state = State::READING_PAYLOAD;
-                        parse_state.total_frame_size = Frame::HEADER_SIZE + length;
+                    // 检查是否有完整的帧
+                    if (data.size() - bytes_consumed >= Frame::HEADER_SIZE + frame_length) {
+                        // 解析完整帧
+                        Frame frame = Frame::deserialize(
+                            std::vector<uint8_t>(
+                                data.begin() + bytes_consumed,
+                                data.begin() + bytes_consumed + Frame::HEADER_SIZE + frame_length
+                            )
+                        );
+                        
+                        completed_frames.push_back(std::move(frame));
+                        bytes_consumed += Frame::HEADER_SIZE + frame_length;
+                        
+                        std::cout << "成功解析帧: stream_id=" << frame.stream_id 
+                                  << ", sequence=" << frame.sequence 
+                                  << ", length=" << frame_length << std::endl;
+                    } else {
+                        // 数据不完整，等待更多数据
+                        std::cout << "帧数据不完整，等待更多数据. 需要: " 
+                                  << (Frame::HEADER_SIZE + frame_length) 
+                                  << " 字节, 当前有: " 
+                                  << (data.size() - bytes_consumed) << " 字节" << std::endl;
+                        break;
                     }
+                } else {
+                    // 头部数据不完整，等待更多数据
+                    std::cout << "帧头不完整，等待更多数据" << std::endl;
+                    break;
                 }
             }
-
-            if (parse_state.state == State::READING_PAYLOAD && bytes_consumed < data.size()) {
-                // 读取payload
-                size_t remaining = parse_state.frame.length - parse_state.payload_bytes_read;
-                size_t available = data.size() - bytes_consumed;
-                size_t bytes_to_read = std::min(remaining, available);
-                
-                std::copy(data.begin() + bytes_consumed,
-                         data.begin() + bytes_consumed + bytes_to_read,
-                         parse_state.frame.payload.begin() + parse_state.payload_bytes_read);
-                
-                parse_state.payload_bytes_read += bytes_to_read;
-                bytes_consumed += bytes_to_read;
-
-                if (parse_state.payload_bytes_read == parse_state.frame.length) {
-                    // 帧完成
-                    if (parse_state.frame.verifyChecksum()) {
-                        completed_frames.push_back(parse_state.frame);
-                        frame_completed = true;
-                    }
-                }
-            }
-
-            if (frame_completed) {
-                it = active_frames_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // 检查是否有新帧的开始
-        while (bytes_consumed < data.size()) {
-            active_frames_.emplace_back(bytes_consumed);
-            break;  // 每次只启动一个新帧的解析
+        } catch (const std::exception& e) {
+            std::cerr << "解析帧时发生错误: " << e.what() << std::endl;
+            // 发生错误时，跳过当前字节，继续尝试解析
+            bytes_consumed++;
         }
 
         return completed_frames;
